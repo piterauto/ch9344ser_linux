@@ -45,7 +45,7 @@
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <asm/byteorder.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/idr.h>
 #include <linux/list.h>
 #include <linux/version.h>
@@ -59,7 +59,7 @@
 
 #define DRIVER_AUTHOR "WCH@TECH39"
 #define DRIVER_DESC "USB serial driver for ch9344/ch348."
-#define VERSION_DESC "V1.8 On 2021.08"
+#define VERSION_DESC "V1.9 On 2025-11-24"
 
 #define IOCTL_MAGIC 'W'
 #define IOCTL_CMD_GPIOENABLE	_IOW(IOCTL_MAGIC, 0x80, u16)
@@ -77,11 +77,14 @@ static DEFINE_MUTEX(ch9344_minors_lock);
 
 
 static void ch9344_tty_set_termios(struct tty_struct *tty,
-                                   struct ktermios *termios_old);
+                                   const struct ktermios *termios_old);
 
 static int ch9344_get_portnum(int index);
 
 static int ch9344_set_uartmode(struct ch9344 *ch9344, int portnum, u8 index, u8 mode);
+
+void cal_outdata(char *buffer, u8 rol, u8 xor);
+u8 cal_recv_tmt(__le32 bd);
 
 /*
  * Look up an CH9344 structure by minor. If found and not disconnected, increment
@@ -736,14 +739,16 @@ static inline void *tty_get_portdata(struct ch9344_ttyport *port)
 	return (port->portdata);
 }
 
-static void ch9344_port_dtr_rts(struct tty_port *port, int raise)
+static void ch9344_port_dtr_rts(struct tty_port *port, bool raise)
 {
-	struct ch9344_ttyport *ttyport = container_of(port, struct ch9344_ttyport, port);
+	struct ch9344_ttyport *ttyport =
+		container_of(port, struct ch9344_ttyport, port);
 	struct ch9344 *ch9344 = tty_get_portdata(ttyport);
 	int portnum = ttyport->portnum;
 	int val;
 	int rv;
 
+	/* Convert bool → int */
 	if (raise)
 		val = CH9344_CTO_D | CH9344_CTO_R;
 	else
@@ -754,10 +759,12 @@ static void ch9344_port_dtr_rts(struct tty_port *port, int raise)
 	rv = ch9344_set_control(ch9344, portnum, 0x01);
 	if (rv)
 		dev_err(&ch9344->control->dev, "failed to set dtr\n");
+
 	rv = ch9344_set_control(ch9344, portnum, 0x11);
 	if (rv)
 		dev_err(&ch9344->control->dev, "failed to set rts\n");
 }
+
 
 static int ch9344_port_activate(struct tty_port *port, struct tty_struct *tty)
 {
@@ -849,33 +856,38 @@ static void ch9344_tty_close(struct tty_struct *tty, struct file *filp)
 	}
 }
 
-static int ch9344_tty_write(struct tty_struct *tty,
-                            const unsigned char *buf, int count)
+static ssize_t ch9344_tty_write(struct tty_struct *tty,
+                                const u8 *buf, size_t count)
 {
 	struct ch9344 *ch9344 = tty->driver_data;
-	int stat;
 	unsigned long flags;
-	int wbn;
 	struct ch9344_wb *wb;
+	int stat;
+	int wbn;
 	int portnum = ch9344_get_portnum(tty->index);
 	int timeout;
 	int maxep = ch9344->writesize / 20;
 	int packnum, maxpacknum;
-	int packlen, total_len, sendlen;
+	int packlen;
+	ssize_t total_len, sendlen;
 
 	if (!count)
 		return 0;
 
+	/* maxpacknum calculation */
 	if (ch9344->writesize % (maxep - 3))
 		maxpacknum = ch9344->writesize / (maxep - 3) + 1;
 	else
 		maxpacknum = ch9344->writesize / (maxep - 3);
 
-	count = count > (ch9344->writesize - maxpacknum * 3) ? \
-	        (ch9344->writesize - maxpacknum * 3) : count;
+	/* limit count */
+	if (count > (ch9344->writesize - maxpacknum * 3))
+		count = ch9344->writesize - maxpacknum * 3;
+
 	total_len = count;
 	sendlen = 0;
 
+	/* number of packets */
 	if (count % (maxep - 3))
 		packnum = count / (maxep - 3) + 1;
 	else
@@ -886,7 +898,7 @@ transmit:
 	wbn = ch9344_wb_alloc(ch9344);
 	if (wbn < 0) {
 		spin_unlock_irqrestore(&ch9344->write_lock, flags);
-		return 0;
+		return sendlen;
 	}
 	wb = &ch9344->wb[wbn];
 
@@ -896,7 +908,7 @@ transmit:
 		return -ENODEV;
 	}
 
-	/* packets deal */
+	/* packet splitting */
 	if (total_len > maxep - 3) {
 		packlen = maxep - 3;
 		total_len -= packlen;
@@ -904,12 +916,12 @@ transmit:
 		packlen = total_len;
 		total_len = 0;
 	}
-	*(wb->buf) = ch9344->port_offset + ch9344_get_portnum(tty->index);
-	*(wb->buf + 1) = packlen;
-	*(wb->buf + 2) = packlen >> 8;
+
+	wb->buf[0] = ch9344->port_offset + portnum;
+	wb->buf[1] = packlen;
+	wb->buf[2] = packlen >> 8;
 	memcpy(wb->buf + 3, buf + sendlen, packlen);
 	wb->len = packlen + 3;
-	sendlen += packlen;
 	wb->portnum = portnum;
 
 	stat = usb_autopm_get_interface_async(ch9344->data);
@@ -922,14 +934,15 @@ transmit:
 	if (ch9344->susp_count) {
 		usb_anchor_urb(wb->urb, &ch9344->delayed);
 		spin_unlock_irqrestore(&ch9344->write_lock, flags);
-		return sendlen;
+		return sendlen + packlen;
 	}
 
 	if (!ch9344->ttyport[portnum].write_empty) {
 		spin_unlock_irqrestore(&ch9344->write_lock, flags);
-		timeout = wait_event_interruptible_timeout(ch9344->ttyport[portnum].wioctl,
-	                                       ch9344->ttyport[portnum].write_empty,
-	                                       msecs_to_jiffies(DEFAULT_TIMEOUT));
+		timeout = wait_event_interruptible_timeout(
+				ch9344->ttyport[portnum].wioctl,
+				ch9344->ttyport[portnum].write_empty,
+				msecs_to_jiffies(DEFAULT_TIMEOUT));
 		if (timeout <= 0) {
 			ch9344->ttyport[portnum].write_empty = true;
 			return sendlen ? sendlen : -ETIMEDOUT;
@@ -946,7 +959,9 @@ transmit:
 	}
 	spin_unlock_irqrestore(&ch9344->write_lock, flags);
 
-	if (total_len != 0)
+	sendlen += packlen;
+
+	if (total_len > 0)
 		goto transmit;
 
 	return sendlen;
@@ -1468,7 +1483,7 @@ u8 cal_recv_tmt(__le32 bd)
 }
 
 static void ch9344_tty_set_termios(struct tty_struct *tty,
-                                   struct ktermios *termios_old)
+                                   const struct ktermios *termios_old)
 {
 	struct ch9344 *ch9344 = tty->driver_data;
 	struct ktermios *termios = &tty->termios;
